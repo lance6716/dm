@@ -27,6 +27,16 @@ import (
 	"github.com/pingcap/dm/pkg/log"
 )
 
+var (
+	keepAliveUpdateCh = make(chan int64, 10)
+)
+
+// NotifyKeepAliveChange is used to dynamically change keepalive TTL and don't let watcher observe a DELETE of old key
+// please make sure the config of TTL is also updated.
+func NotifyKeepAliveChange(newTTL int64) {
+	keepAliveUpdateCh <- newTTL
+}
+
 // WorkerEvent represents the PUT/DELETE keepalive event of DM-worker.
 type WorkerEvent struct {
 	WorkerName string    `json:"worker-name"` // the worker name of the worker.
@@ -74,6 +84,10 @@ func workerEventFromKey(key string) (WorkerEvent, error) {
 func KeepAlive(ctx context.Context, cli *clientv3.Client, workerName string, keepAliveTTL int64) error {
 	cliCtx, cancel := context.WithTimeout(ctx, etcdutil.DefaultRequestTimeout)
 	defer cancel()
+	// TTL in keepAliveUpdateCh has higher priority
+	for len(keepAliveUpdateCh) > 0 {
+		keepAliveTTL = <-keepAliveUpdateCh
+	}
 	lease, err := cli.Grant(cliCtx, keepAliveTTL)
 	if err != nil {
 		return err
@@ -98,7 +112,12 @@ func KeepAlive(ctx context.Context, cli *clientv3.Client, workerName string, kee
 		}
 	}()
 
-	ch, err := cli.KeepAlive(ctx, lease.ID)
+	keepAliveCtx, keepAliveCancel := context.WithCancel(ctx)
+	defer func() {
+		keepAliveCancel()
+	}()
+
+	ch, err := cli.KeepAlive(keepAliveCtx, lease.ID)
 	if err != nil {
 		return err
 	}
@@ -107,11 +126,47 @@ func KeepAlive(ctx context.Context, cli *clientv3.Client, workerName string, kee
 		case _, ok := <-ch:
 			if !ok {
 				log.L().Info("keep alive channel is closed")
+				keepAliveCancel() // make go vet happy
 				return nil
 			}
 		case <-ctx.Done():
 			log.L().Info("ctx is canceled, keepalive will exit now")
+			keepAliveCancel() // make go vet happy
 			return nil
+		case newTTL := <-keepAliveUpdateCh:
+			// create a new lease with new TTL, and overwrite original KV
+			// make use of defer in function scope
+			leaseID, err := func() (clientv3.LeaseID, error) {
+				cliCtx, cancel := context.WithTimeout(ctx, etcdutil.DefaultRequestTimeout)
+				defer cancel()
+				lease, err = cli.Grant(cliCtx, newTTL)
+				if err != nil {
+					log.L().Error("meet error when change keepalive TTL", zap.Error(err))
+					return 0, err
+				}
+				_, err = cli.Put(cliCtx, k, workerEventJSON, clientv3.WithLease(lease.ID))
+				if err != nil {
+					log.L().Error("meet error when change keepalive TTL", zap.Error(err))
+					return 0, err
+				}
+				return lease.ID, nil
+			}()
+			if err != nil {
+				keepAliveCancel() // make go vet happy
+				return err
+			}
+
+			oldCancel := keepAliveCancel
+			//nolint:lostcancel
+			keepAliveCtx, keepAliveCancel = context.WithCancel(ctx)
+			ch, err = cli.KeepAlive(keepAliveCtx, leaseID)
+			if err != nil {
+				log.L().Error("meet error when change keepalive TTL", zap.Error(err))
+				keepAliveCancel() // make go vet happy
+				return err
+			}
+			// after new keepalive is succeed, we cancel the old keepalive
+			oldCancel()
 		}
 	}
 }
